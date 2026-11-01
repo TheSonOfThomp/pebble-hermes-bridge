@@ -31,10 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-try:
-    from index01_adapter import whatsapp_ack  # package install
-except ImportError:
-    import whatsapp_ack  # running from the checkout directory
+import whatsapp_ack
 
 import aiohttp
 import yaml
@@ -130,9 +127,6 @@ class Config:
     ack_chat_id: Optional[str] = None        # e.g. "1203...@g.us"; None disables
     ack_bridge_port: int = 3000
     ack_emoji: str = "🪨"
-    # Spoken-phrase action triggers (phone_action.py); read fresh per press.
-    actions_enabled: bool = False
-    ack_call_emoji: str = "📞"
 
     @property
     def signing_enabled(self) -> bool:
@@ -190,10 +184,7 @@ def load_config() -> Config:
     ack_chat = env.get("INDEX01_ACK_CHAT_ID", _get("whatsapp", "ack_chat_id"))
     ack_port = int(_get("whatsapp", "ack_bridge_port", default=3000))
     ack_emoji = env.get("INDEX01_ACK_EMOJI", _get("whatsapp", "ack_emoji", default="🪨"))
-    actions_enabled = bool(_get("actions", "enabled", default=False))
-    call_emoji = env.get(
-        "INDEX01_ACK_CALL_EMOJI", _get("whatsapp", "ack_call_emoji", default="📞")
-    )
+
 
     missing = [k for k, v in (("route_secret", route), ("hermes_url", hermes_url)) if not v]
     if missing:
@@ -203,11 +194,10 @@ def load_config() -> Config:
         )
 
     if not signing or signing == "":
-        if env.get("INDEX01_ALLOW_UNSIGNED") != "1":
+        if not bearer and env.get("INDEX01_ALLOW_UNSIGNED") != "1":
             raise ValueError(
-                "signing_secret is required (set pebble.signing_secret in %s or "
-                "INDEX01_SIGNING_SECRET; set INDEX01_ALLOW_UNSIGNED=1 to run without verification)"
-                % path
+                "signing_secret or bearer_token is required (set pebble.signing_secret, "
+                "pebble.bearer_token, or INDEX01_ALLOW_UNSIGNED=1)"
             )
 
     return Config(
@@ -223,8 +213,6 @@ def load_config() -> Config:
         ack_chat_id=(str(ack_chat).strip() or None) if ack_chat else None,
         ack_bridge_port=ack_port,
         ack_emoji=str(ack_emoji),
-        actions_enabled=actions_enabled,
-        ack_call_emoji=str(call_emoji),
     )
 
 
@@ -579,82 +567,16 @@ async def dispatch(request: web.Request, ctx: _Ctx) -> web.Response:
         except (TypeError, ValueError) as exc:
             raise BadRequest("recordedAt is missing or not an epoch-ms integer") from exc
 
-        # Sensitive-content gate only (privacy guardrail; see pebble_router.py).
-        # Topic routing is the pebble session's job now: the agent classifies the press
-        # intelligently and cross-posts its answer with the `wa` CLI (aliases -> JIDs
-        # live in routing.yaml; the model never sees or chooses JIDs).
-        from pebble_router import load_routing, sensitive_hit
-
-        try:
-            rcfg = load_routing()
-            sens = sensitive_hit(transcript, rcfg)
-        except Exception:
-            # Fail CLOSED: an unreadable gate must never silently disable the privacy
-            # guardrail. Flag sensitive so the session errs toward intake.
-            log.exception("routing.yaml unreadable - gate fails closed (sensitive=True)")
-            sens = ["gate-unavailable"]
+        # Forward only the transcript and event metadata. Topic routing and phone
+        # actions belong to Hermes, not this narrow relay.
         payload = {
-            "transcript": transcript,
+            "transcription": transcript,
             "recordedAt": recorded_at,
             "trigger": trigger,
             "delivery": delivery,
             "isTest": is_test,
-            "sensitive": bool(sens),
         }
-        if sens:
-            payload["routing_reason"] = f"sensitive content detected ({sens[0]}) - answer in intake"
-        log.info(
-            "gated press",
-            extra={"json_fields": {
-                "delivery": delivery,
-                "sensitive": bool(sens),
-            }},
-        )
-
-        # --- action triggers (spoken command, deterministic) ----------------
-        # GATE > TRIGGER: a sensitive-gate hit never auto-dials. Actions are
-        # configured in config.yaml `actions:` (read fresh per press; invalid
-        # config or enabled: false = no action, press forwards normally).
-        action_fired: Optional[str] = None
-        action_detail = ""
-        action_matched: Optional[str] = None
-        if not sens:
-            try:
-                import phone_action
-
-                enabled, rate, triggers = phone_action.get_actions()
-                if enabled and triggers:
-                    action = phone_action.match_action(transcript, triggers)
-                    if action:
-                        action_matched = action
-                        session_for_action = getattr(ctx.forwarder, "_session", None)
-                        ok, action_detail = await phone_action.fire_action(
-                            session_for_action,
-                            triggers[action],
-                            delivery=delivery,
-                            rate_limit_per_hour=rate,
-                        )
-                        if ok:
-                            action_fired = action
-                        log.info(
-                            "action trigger",
-                            extra={"json_fields": {
-                                "delivery": delivery,
-                                "action": action,
-                                "ok": ok,
-                                "detail": action_detail,
-                            }},
-                        )
-            except Exception:
-                # Fail CLOSED: action config problems must never break the press.
-                log.exception("action trigger setup failed - press forwarded without action")
-                action_detail = "action-config-error"
-
-        # The action still forwards to Hermes (session logs the press + can
-        # answer questions about it); the agent sees the marker in the payload.
-        if action_fired:
-            payload["action_fired"] = action_fired
-
+        log.info("forwarding press", extra={"json_fields": {"delivery": delivery}})
 
         status = await ctx.forwarder.send(payload, delivery)
         log.info(
@@ -687,17 +609,7 @@ async def dispatch(request: web.Request, ctx: _Ctx) -> web.Response:
                     log.warning("ack send failed", extra={"json_fields": {"chat_id": chat_id}},
                                 exc_info=True)
 
-            # Receipt lands in intake; the agent itself announces where it routed
-            # the answer (it cross-posts via `wa send`).
             ack_text = f'{cfg.ack_emoji} _"{short}"_\n⏳ Working on it…'
-            if action_matched:
-                if action_fired:
-                    ack_text += f'\n{cfg.ack_call_emoji} action: {action_fired} (dialing)'
-                else:
-                    ack_text += (
-                        f'\n{cfg.ack_call_emoji} action: {action_matched} '
-                        f'NOT fired ({action_detail or "failed"})'
-                    )
             ack_task = asyncio.create_task(_send_ack(cfg.ack_chat_id, ack_text))
             # Don't let a hung bridge delay the app's response.
             ack_task.add_done_callback(lambda _t: None)
@@ -831,9 +743,9 @@ def main() -> None:
     setup_logging(log_level)
     log = get_logger("index01")
     if not cfg.signing_enabled:
-        log.critical(
-            "signing_secret is not configured; inbound requests will not be authenticated",
-            extra={"json_fields": {"allow_unsigned": True}},
+        log.warning(
+            "Pebble HMAC verification is disabled; unsigned requests require the configured bearer token",
+            extra={"json_fields": {"bearer_auth_configured": bool(cfg.bearer_token)}},
         )
     log.info(
         "starting index01-adapter",

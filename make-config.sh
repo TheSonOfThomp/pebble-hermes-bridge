@@ -1,51 +1,75 @@
 #!/usr/bin/env bash
-# Generates config.yaml (+ secrets.env on first run) for the index01-adapter.
-# Never prints secret values. Run from the repo checkout.
+# Generate the bridge's private config without changing Hermes configuration.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Optional local values (ACK_CHAT_ID, ...) from the git-ignored .env.
+# Optional acknowledgement settings are local opt-in values only.
 if [ -f .env ]; then set -a; . ./.env; set +a; fi
 
-# First run: generate fresh random secrets.
-if [ ! -f secrets.env ]; then
-  {
-    echo "PEBBLE_SIGNING_SECRET=$(openssl rand -hex 32)"
-    echo "HERMES_ROUTE_SECRET=$(openssl rand -hex 32)"
-    echo "PEBBLE_BEARER_TOKEN=$(openssl rand -hex 24)"
-  } > secrets.env
-  chmod 600 secrets.env
-  echo "secrets.env generated (600 perms). Keep it private; it is gitignored."
+ROUTE_FILE="${HERMES_HOME:-$HOME/.hermes}/webhook_subscriptions.json"
+if [ ! -r "$ROUTE_FILE" ]; then
+  echo "Hermes webhook subscriptions not found: $ROUTE_FILE" >&2
+  exit 1
 fi
 
-for var in PEBBLE_SIGNING_SECRET HERMES_ROUTE_SECRET PEBBLE_BEARER_TOKEN; do
-  if ! grep -q "^${var}=" secrets.env; then
-    echo "missing ${var} in secrets.env" >&2; exit 1
+ROUTE_SECRET="$(ROUTE_FILE="$ROUTE_FILE" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+try:
+    route = json.loads(Path(os.environ["ROUTE_FILE"]).read_text())["pebble"]
+    secret = route["secret"]
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    raise SystemExit(f"Unable to read the Hermes 'pebble' route: {exc}")
+if not isinstance(secret, str) or not secret:
+    raise SystemExit("Hermes 'pebble' route has no secret")
+print(secret)
+PY
+)"
+
+# Preserve Pebble credentials across deployments so the app does not need reconfiguration.
+PEBBLE_BEARER_TOKEN=""
+PEBBLE_SIGNING_SECRET=""
+if [ -f config.yaml ]; then
+  bearer_line="$(grep -E '^  bearer_token: ' config.yaml | head -n 1 || true)"
+  signing_line="$(grep -E '^  signing_secret: ' config.yaml | head -n 1 || true)"
+  if [ -n "$bearer_line" ]; then
+    PEBBLE_BEARER_TOKEN="${bearer_line#*: }"
+    PEBBLE_BEARER_TOKEN="${PEBBLE_BEARER_TOKEN#\"}"
+    PEBBLE_BEARER_TOKEN="${PEBBLE_BEARER_TOKEN%\"}"
   fi
-done
-PEB="$(grep '^PEBBLE_SIGNING_SECRET=' secrets.env | cut -d= -f2)"
-HER="$(grep '^HERMES_ROUTE_SECRET=' secrets.env | cut -d= -f2)"
-BEAR="$(grep '^PEBBLE_BEARER_TOKEN=' secrets.env | cut -d= -f2)"
-cat > config.yaml << EOF
+  if [ -n "$signing_line" ]; then
+    PEBBLE_SIGNING_SECRET="${signing_line#*: }"
+    PEBBLE_SIGNING_SECRET="${PEBBLE_SIGNING_SECRET#\"}"
+    PEBBLE_SIGNING_SECRET="${PEBBLE_SIGNING_SECRET%\"}"
+  fi
+fi
+if [ -z "$PEBBLE_BEARER_TOKEN" ]; then
+  PEBBLE_BEARER_TOKEN="$(openssl rand -hex 24)"
+fi
+PEBBLE_SIGNING_SECRET_YAML=""
+if [ -n "$PEBBLE_SIGNING_SECRET" ]; then
+  PEBBLE_SIGNING_SECRET_YAML="  signing_secret: \"${PEBBLE_SIGNING_SECRET}\""
+fi
+ACK_CHAT_ID="${ACK_CHAT_ID:-}"
+cat > config.yaml <<EOF
 pebble:
-  signing_secret: "${PEB}"
-  bearer_token: "${BEAR}"
+  bearer_token: "${PEBBLE_BEARER_TOKEN}"
+${PEBBLE_SIGNING_SECRET_YAML}
   max_body_size: 5242880
   max_timestamp_age: 300
 hermes:
-  route_secret: "${HER}"
+  route_secret: "${ROUTE_SECRET}"
   url: "http://127.0.0.1:8644/webhooks/pebble"
 listen:
   host: "127.0.0.1"
   port: 8645
-# Instant "🪨 Heard. Working on it…" ack in a WhatsApp group when a press arrives.
-# Uses the local Baileys bridge. Leave ack_chat_id empty to disable.
 whatsapp:
-  ack_chat_id: "${ACK_CHAT_ID:-}"
+  ack_chat_id: "${ACK_CHAT_ID}"
   ack_bridge_port: 3000
   ack_emoji: "🪨"
 log_level: "INFO"
 EOF
 chmod 600 config.yaml
-echo "config.yaml written (600 perms)"
-echo "Route secret for the Hermes config.yaml route block: use the same value as hermes.route_secret (see apply-hermes-config.py)."
+echo "config.yaml written (600 perms); WhatsApp acknowledgements are disabled unless ACK_CHAT_ID is set."

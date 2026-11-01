@@ -297,6 +297,17 @@ def test_too_many_parts_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_healthz_reports_ok() -> None:
+    client = await make_client(make_config(), FakeForwarder(), clock=lambda: 1700000300.0)
+    try:
+        response = await client.get("/healthz")
+        assert response.status == 200
+        assert await response.json() == {"status": "ok"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_valid_request_forwards_expected_payload() -> None:
     fwd = FakeForwarder(status=202)
     body, headers = valid_body()
@@ -307,16 +318,13 @@ async def test_valid_request_forwards_expected_payload() -> None:
         assert len(fwd.calls) == 1
         payload, delivery = fwd.calls[0]
         assert delivery == "fileId-42"
-        assert payload["transcript"] == "remind me to water plants"
+        assert payload["transcription"] == "remind me to water plants"
         assert payload["recordedAt"] == 1700000000500
         assert payload["trigger"] == "single-click-hold"
         assert payload["delivery"] == "fileId-42"
         assert payload["isTest"] is False
-        # LLM-routing design: adapter only gates sensitive content; normal presses
-        # carry no routing fields - the session decides the group.
-        assert payload["sensitive"] is False
-        assert "routing_label" not in payload
-        assert "routing_chat_id" not in payload
+        assert "transcript" not in payload
+        assert "sensitive" not in payload
     finally:
         await client.close()
 
@@ -475,7 +483,7 @@ async def test_unsigned_bearer_only_synthesizes_headers() -> None:
         assert resp.status == 202
         assert len(fwd.calls) == 1
         payload, delivery = fwd.calls[0]
-        assert payload["transcript"] == "bearer only press"
+        assert payload["transcription"] == "bearer only press"
         assert delivery.startswith("unsigned-")
         assert payload["trigger"] == "single-click-hold"
         assert payload["isTest"] is False
@@ -645,7 +653,7 @@ async def test_signing_disabled_compat() -> None:
     try:
         resp = await client.post("/", data=body, headers=headers)
         assert resp.status == 202
-        assert fwd.calls[0][0]["transcript"] == "demo entry"
+        assert fwd.calls[0][0]["transcription"] == "demo entry"
     finally:
         await client.close()
 
@@ -682,7 +690,7 @@ async def test_real_forwarder_signature_verified_by_fake_hermes() -> None:
                 session, ROUTE_SECRET, url, timeout=5.0, clock=lambda: 1700000300.0
             )
             payload = {
-                "transcript": "hello",
+                "transcription": "hello",
                 "recordedAt": 1700000000500,
                 "trigger": "single-click-hold",
                 "delivery": "rt-1",
@@ -715,14 +723,27 @@ def test_load_config_missing_file_uses_env(tmp_path, monkeypatch) -> None:
     assert cfg.signing_enabled is False
 
 
-def test_load_config_missing_signing_secret_raises(tmp_path, monkeypatch) -> None:
+def test_load_config_missing_pebble_auth_raises(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("INDEX01_CONFIG", str(tmp_path / "does_not_exist.yaml"))
     monkeypatch.setenv("INDEX01_ROUTE_SECRET", "env_route")
     monkeypatch.setenv("INDEX01_HERMES_URL", "http://env:1/hook")
     monkeypatch.delenv("INDEX01_ALLOW_UNSIGNED", raising=False)
     monkeypatch.delenv("INDEX01_SIGNING_SECRET", raising=False)
-    with pytest.raises(ValueError, match="signing_secret is required"):
+    with pytest.raises(ValueError, match="signing_secret or bearer_token is required"):
         load_config()
+
+
+def test_load_config_bearer_only_allows_unsigned_pebble(tmp_path, monkeypatch) -> None:
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "pebble:\n  bearer_token: pebble-bearer\n"
+        "hermes:\n  route_secret: route\n  url: http://127.0.0.1:8644/webhooks/pebble\n"
+    )
+    monkeypatch.setenv("INDEX01_CONFIG", str(cfg_file))
+    monkeypatch.delenv("INDEX01_ALLOW_UNSIGNED", raising=False)
+    cfg = load_config()
+    assert cfg.signing_enabled is False
+    assert cfg.bearer_token == "pebble-bearer"
 
 
 def test_load_config_missing_required_raises(tmp_path, monkeypatch) -> None:
@@ -731,38 +752,6 @@ def test_load_config_missing_required_raises(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("INDEX01_HERMES_URL", raising=False)
     with pytest.raises(ValueError):
         load_config()
-
-# --- topic routing (Option C) -------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_keyword_press_sets_routing_fields() -> None:
-    fwd = FakeForwarder(status=202)
-    body, headers = valid_body(transcript="when does my minivan need an oil change", ts="1700000300")
-    client = await make_client(make_config(), fwd, clock=lambda: 1700000300.0)
-    try:
-        resp = await client.post("/anything", data=body, headers=headers)
-        assert resp.status == 202
-        payload, _ = fwd.calls[0]
-        # car press is NOT sensitive; topic choice belongs to the LLM session
-        assert payload["sensitive"] is False
-        assert "routing_label" not in payload
-    finally:
-        await client.close()
-
-
-@pytest.mark.asyncio
-async def test_sensitive_press_forced_intake() -> None:
-    fwd = FakeForwarder(status=202)
-    body, headers = valid_body(transcript="check my portfolio and my blood pressure results", ts="1700000300")
-    client = await make_client(make_config(), fwd, clock=lambda: 1700000300.0)
-    try:
-        resp = await client.post("/anything", data=body, headers=headers)
-        assert resp.status == 202
-        payload, _ = fwd.calls[0]
-        assert payload["sensitive"] is True
-        assert "blood pressure" in payload["routing_reason"]
-    finally:
-        await client.close()
 
 
 @pytest.mark.asyncio
@@ -793,28 +782,5 @@ async def test_press_acks_intake_single() -> None:
         assert "⏳" in text
         adapt.whatsapp_ack = orig_module
         wack.send_ack = orig_send
-    finally:
-        await client.close()
-
-
-
-
-@pytest.mark.asyncio
-async def test_gate_fails_closed_on_bad_routing_yaml(monkeypatch) -> None:
-    """Reviewer finding: routing.yaml failure silently disabled the sensitive gate."""
-    import adapter as adapt
-    fwd = FakeForwarder(status=202)
-    body, headers = valid_body(transcript="remind me to water the plants", ts="1700000300")
-    client = await make_client(make_config(), fwd, clock=lambda: 1700000300.0)
-    try:
-        import pebble_router
-        def boom(*a, **k):
-            raise RuntimeError("yaml broken")
-        monkeypatch.setattr(pebble_router, "load_routing", boom)
-        resp = await client.post("/anything", data=body, headers=headers)
-        assert resp.status == 202
-        payload, _ = fwd.calls[0]
-        assert payload["sensitive"] is True  # fail closed, not open
-        assert "gate-unavailable" in payload["routing_reason"]
     finally:
         await client.close()
